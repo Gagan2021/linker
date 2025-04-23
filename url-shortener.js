@@ -2,18 +2,23 @@ import express from 'express';
 import { nanoid } from 'nanoid';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { createClient } from 'redis';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// In-memory storage
-const urlStorage = new Map();
+const redisClient = createClient({
+    url: `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`
+});
 
+redisClient.connect()
+    .then(() => console.log('Connected to Redis'))
+    .catch(err => console.error('Redis connection error:', err));
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-// Serve the HTML frontend
+// Frontend HTML (unchanged)
 const html = `
 <!DOCTYPE html>
 <html>
@@ -33,7 +38,7 @@ const html = `
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        input, button {
+        input, button, select {
             width: 100%;
             padding: 0.75rem;
             margin: 0.5rem 0;
@@ -62,7 +67,12 @@ const html = `
     <div class="container">
         <h1>URL Shortener</h1>
         <div>
-            <input type="url" id="urlInput" placeholder="Enter your URL with parameters...">
+            <input type="text" id="domainInput" placeholder="Enter domain (e.g., ex.com)">
+            <select id="trafficType">
+                <option value="organic">Organic Traffic</option>
+                <option value="custom_utm">Custom UTM</option>
+            </select>
+            <input type="text" id="utmInput" placeholder="Enter UTM string (e.g., utm_source=newsletter&utm_medium=email)" style="display: none;">
             <button onclick="shortenUrl()">Shorten URL</button>
         </div>
         <div id="result" class="result">
@@ -72,15 +82,29 @@ const html = `
     </div>
 
     <script>
+        const trafficTypeSelect = document.getElementById('trafficType');
+        const utmInput = document.getElementById('utmInput');
+
+        trafficTypeSelect.addEventListener('change', () => {
+            utmInput.style.display = trafficTypeSelect.value === 'custom_utm' ? 'block' : 'none';
+        });
+
         async function shortenUrl() {
-            const longUrl = document.getElementById('urlInput').value;
-            if (!longUrl) return;
+            const domain = document.getElementById('domainInput').value;
+            const trafficType = document.getElementById('trafficType').value;
+            let utmString = '';
+
+            if (trafficType === 'custom_utm') {
+                utmString = document.getElementById('utmInput').value;
+            }
+
+            if (!domain) return;
 
             try {
                 const response = await fetch('/api/shorten', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: longUrl })
+                    body: JSON.stringify({ domain, trafficType, utmString })
                 });
                 const data = await response.json();
                 
@@ -102,57 +126,94 @@ const html = `
 </html>
 `;
 
+// Random string generator for Google redirect
+function generateRandomString(length) {
+    const characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += characters.charAt(Math.floor(Math.random() * characters.length));
+    }
+    return result;
+}
+
+// Google redirect link generator
+function generateGoogleRedirectLink(targetUrl) {
+    const baseUrl = 'https://www.google.com/url';
+    const fixedParams = {
+        sa: 't',
+        source: 'web',
+        rct: 'j',
+        opi: '89978449',
+        url: targetUrl,
+        usg: 'AOvVaw3YTuLjBL02hOLrgnxSom7A',
+        utm_source: 'google',
+        utm_medium: 'organic'
+    };
+
+    const randomMiddle = generateRandomString(6);
+    const randomLocation = generateRandomString(12);
+    const ved = `2ahUKEwj${randomMiddle}l-2MAx${randomLocation}QFnoECCYQAQ`;
+
+    const queryParams = new URLSearchParams({ ...fixedParams, ved }).toString();
+    return `${baseUrl}?${queryParams}`;
+}
+
 // API Routes
-app.post('/api/shorten', (req, res) => {
+app.post('/api/shorten', async (req, res) => {
     try {
-        const longUrl = req.body.url;
-        if (!longUrl) {
-            return res.status(400).json({ error: 'URL is required' });
+        const { domain, trafficType, utmString } = req.body;
+        if (!domain) {
+            return res.status(400).json({ error: 'Domain is required' });
         }
 
-        // Parse URL and extract parameters
-        const urlObj = new URL(longUrl);
-        const parameters = {};
-        urlObj.searchParams.forEach((value, key) => {
-            parameters[key] = value;
-        });
-
-        // Generate short ID and store URL data
         const shortId = nanoid(8);
-        urlStorage.set(shortId, {
-            longUrl: urlObj.origin + urlObj.pathname,
-            parameters
-        });
+        const data = {
+            domain,
+            trafficType,
+            utmString: trafficType === 'custom_utm' ? utmString : null
+        };
+        await redisClient.set(shortId, JSON.stringify(data));
 
         res.json({ shortId });
     } catch (error) {
-        res.status(400).json({ error: 'Invalid URL' });
+        res.status(400).json({ error: 'Invalid input' });
     }
 });
 
-// Redirect route
-app.get('/s/:shortId', (req, res) => {
-    const urlData = urlStorage.get(req.params.shortId);
-    if (!urlData) {
-        return res.status(404).send('URL not found');
+// Redirect route with clearing cookies and headers
+app.get('/s/:shortId', async (req, res) => {
+    try {
+        const shortId = req.params.shortId;
+        const data = await redisClient.get(shortId);
+        if (!data) {
+            return res.status(404).send('URL not found');
+        }
+
+        const { domain, trafficType, utmString } = JSON.parse(data);
+        let targetUrl = `https://${domain}`;
+
+        // Clear cookies
+        Object.keys(req.cookies || {}).forEach(cookie => {
+            res.clearCookie(cookie);
+        });
+
+        // Clear headers
+        res.removeHeader('Referer');
+        res.removeHeader('Referrer-Policy');
+
+        // Handle redirect based on traffic type
+        if (trafficType === 'custom_utm' && utmString) {
+            // Parse UTM string and use user-provided values
+            const utmParams = new URLSearchParams(utmString);
+            targetUrl += `?${utmParams.toString()}`;
+            res.redirect(targetUrl);
+        } else {
+            const googleRedirectUrl = generateGoogleRedirectLink(targetUrl);
+            res.redirect(googleRedirectUrl);
+        }
+    } catch (error) {
+        res.status(500).send('Server error');
     }
-
-    // Clear all cookies
-    Object.keys(req.cookies || {}).forEach(cookie => {
-        res.clearCookie(cookie);
-    });
-
-    // Construct URL with stored parameters
-    const url = new URL(urlData.longUrl);
-    Object.entries(urlData.parameters).forEach(([key, value]) => {
-        url.searchParams.set(key, value);
-    });
-
-    // Set headers for GA4 organic search simulation
-    res.setHeader('Referrer-Policy', 'unsafe-url');
-    res.setHeader('Referer', 'https://www.google.com/search');
-
-    res.redirect(url.toString());
 });
 
 // Serve frontend
